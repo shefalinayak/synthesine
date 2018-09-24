@@ -1,4 +1,4 @@
-const libraryCode = processorName => `
+const libraryCode = (processorName, sampleRate) => `
 
 // WAVE OPERATIONS
 
@@ -348,19 +348,6 @@ class WaveTable extends Wave {
 
 }
 
-// DEFAULT VARIABLES
-
-let time, numSamples;
-
-const updateTime = () => {
-  if(!time){
-    time = new Wave(numSamples).fill(0);
-    time = time.map((e,i) => e + i / sampleRate);
-  }
-  else{
-    time = time.map(t => t + numSamples / sampleRate);
-  }
-};
 
 // INTERACT
 
@@ -377,18 +364,56 @@ function askToCreateSlider(label, min, max, step) {
   );
 };
 
+// ERROR HANDLING
+
+function getLineNo(error) {
+  let errorStack = error.stack.split('at');
+  errorStack = errorStack[errorStack.length - 2];
+  let blobStart = errorStack.indexOf('(');
+  let blobEnd = errorStack.indexOf(')');
+  let blob = errorStack.substring(blobStart+1, blobEnd).split(":");
+  let lineNo = blob[blob.length - 2];
+
+  return lineNo;
+}
+
+
+// clock function to update time on every loop
+
+const getTime = () => {
+
+  let internalTime;
+
+  function init() {
+    internalTime = new Wave(numSamples).map((e,i) => e + i / sampleRate);
+    return internalTime;
+  }
+
+  function tick() {
+    internalTime = internalTime.map(t => t + numSamples / sampleRate);
+    return internalTime;
+  };
+
+  return {
+    init: init,
+    tick: tick
+  };
+};
+
+const clock = getTime();
 
 // WORKLET SETUP
 
+let numSamples;
+const sampleRate = ${sampleRate};
 let slider;
+let time;
+let initialized = false;
 
-// stuff below is the standard way to start an audioProcessor
 class AudioProcessor extends AudioWorkletProcessor {
 
   constructor(options) {
     super(options);
-
-    slider = askToCreateSlider.bind(this);
 
     // listens for messages from the node, which is in the global scope
     this.port.onmessage = (event) => {
@@ -404,21 +429,42 @@ class AudioProcessor extends AudioWorkletProcessor {
 
   }
 
+  // runs on every sound frame
   process(inputs, outputs, parameters) {
-    let input = inputs[0][0];
-    let output = outputs[0][0];
+    try {
+      let input = inputs[0][0];
+      let output = outputs[0][0];
 
-    if(!numSamples){
-      numSamples = output.length;
-      updateTime();
-      setup.call(this); // setup runs once
-                        // pass 'this' along so we can send messages
-                        // using this page's messageport
+      if (!initialized) {
+        numSamples = output.length;
+
+        time = clock.init(); // initialize time
+
+        slider = askToCreateSlider.bind(this);
+
+        // setup runs once
+        // pass 'this' along so we can send messages
+        // using the worklet messageport
+        setup.call(this);
+
+        initialized = true;
+      }
+
+      output.set(loop().clip(0.5));
+      time = clock.tick();
+
+    } catch (error) {
+
+      this.port.postMessage(
+        {
+          type: 'error',
+          error: error.message
+          // lineNo: getLineNo(error)
+        }
+      );
+
+      throw error;
     }
-
-    // calls to custom functions (these run on every frame of 128 samples)
-    output.set(loop().clip(0.5));
-    updateTime();
 
     return true;
   }
@@ -459,28 +505,26 @@ var synth = (function () {
   resizeObserver.observe(document.getElementById("container"),{attributes:true});
 
   // this code will be loaded into the worklet
-  function getCode(userCode, processorName){
-    return URL.createObjectURL(new Blob([userCode + '\n' + libraryCode(processorName)], { type: 'application/javascript' }));
+  function getCode(userCode, processorName, sampleRate){
+    return URL.createObjectURL(
+      new Blob([userCode + '\n' + libraryCode(processorName, sampleRate)],
+        { type: 'application/javascript' })
+    );
   }
 
-  function startWorklet(userCode){
+  function startWorklet(userCode) {
     let processorName = 'audio-processor' + processorCount;
     processorCount++;
-
-    let moduleDataUrl = getCode(userCode, processorName);
 
     if (!audioCtx) {
       audioCtx = new AudioContext();
     }
 
+    let moduleDataUrl = getCode(userCode, processorName, audioCtx.sampleRate);
+
     // Loads module script via AudioWorklet.
     audioCtx.audioWorklet.addModule(moduleDataUrl).then(() => {
       node = new AudioWorkletNode(audioCtx, processorName);
-      node.onprocessorerror = () => {
-        console.log('Detected error from audioworklet');
-        var errorMsg = " Error in AudioWorklet: see browser console for details";
-        document.getElementById("log").innerHTML = errorMsg;
-      };
       analyser = audioCtx.createAnalyser();
       node.connect(audioCtx.destination);
       node.connect(analyser);
@@ -494,9 +538,33 @@ var synth = (function () {
         let msg = event.data;
 
         if (typeof msg === 'object') {
+
           if (msg["type"] == "slider") {
             makeSlider(msg["label"], msg["val"], msg["min"], msg["max"], msg["step"]);
           }
+
+          else if (msg["type"] == "error") {
+            let errorMsg = ' Error';
+            if(msg.lineNo) {
+              errorMsg += ' (line ';
+              errorMsg += msg.lineNo;
+              errorMsg += ')';
+            }
+            errorMsg += ': ';
+            if(msg.error.includes('Cannot read property') &&
+              msg.error.includes('of undefined'))
+            {
+              errorMsg += 'A function is expecting input that it isn\'t receiving';
+            }
+            else if (msg.error.includes('undefined is not a function')){
+              errorMsg += 'A function is expecting input that it isn\'t receiving';
+            }
+            else {
+              errorMsg += msg.error;
+            }
+            document.getElementById("log").innerHTML = errorMsg;
+          }
+
         }
 
       };
